@@ -1,5 +1,0 @@
-mode: simple
-lora_A: kaiming
-lora_B: kaiming
-dtype: fp32
-stable_gamma: 16
