@@ -1,0 +1,1660 @@
+"""
+PrunePEFT (LoRA) training and evaluation script.
+
+Author: zzh
+
+Usage Examples:
+    # Train only
+    python controller.py --adapter_types lora --lora_rank 8
+
+    # Train and test on GSM8K
+    python controller.py --test_dataset gsm8k
+
+    # Train and test on HumanEval
+    python controller.py --test_dataset humaneval
+
+    # Train and test on MT-Bench
+    python controller.py --test_dataset mt-bench
+
+    # Test existing model on GSM8K
+    python controller.py --test_dataset gsm8k --model_path /path/to/model
+
+Available test datasets:
+    - gsm8k: Mathematical reasoning evaluation
+    - humaneval: Code generation evaluation
+    - mt-bench: Multi-turn conversation evaluation (saves results for GPT judging)
+    - none: No evaluation (default)
+"""
+
+import argparse
+import logging
+import os
+import re
+import subprocess
+
+import torch
+from accelerate import Accelerator
+from peft import get_peft_model
+from peft.tuners.prunepeft import PrunePEFTConfig
+from peft.tuners.prunepeft.model import (
+    _get_trainable_parameter_names,
+    _group_parameters_by_prefix,
+    cleanup_pruning_hooks,
+    compute_pruning_rankings,
+    get_pruning_process_info,
+    hook_pruning_process_info,
+)
+
+import wandb
+
+# from reproduce.utils import model_inference
+# from reproduce.utils import model_inference
+from examples.data import DATASET_MAP
+from examples.utils import (
+    find_all_linear_modules,
+    initialize_text_to_text_model,
+    model_inference,
+    model_inference_batch,
+    preprocess_dataset,
+    train_text_to_text_model,
+    transform_dataset,
+)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# HumanEval evaluation constants
+ALPACA_PREFIX_TEMPLATE_MD = """Below is an instruction that describes a task.
+ Write a response that appropriately completes the request.
+
+### Instruction:
+Complete the following Python code:
+Notes: respond with the entire complete function definition
+do not add any comments, be as concise in your code as possible
+use only built-in libraries, assume no additional imports other than those provided (if any)
+use `    ` (4 spaces) for each level of indentation
+
+code:
+```python
+{PROMPT}
+```
+
+### Response:
+```python
+"""
+
+
+def post_process(text):
+    """Post-process text output for HumanEval generation."""
+    text = text.replace("```", "")
+    text = text.replace("\t", "    ")
+    text = re.sub(r'(""".*?"""|\'\'\'[^\']*?\'\'\')', "", text, flags=re.DOTALL)
+    text = "\n".join([ll.rstrip() for ll in text.splitlines() if ll.strip()])
+    lines = text.split("\n")
+    spaces_for_each_line = []
+    for line in lines:
+        match = re.match(r"^( *)", line)
+        if match:
+            leading_spaces = len(match.group(1))
+            spaces_for_each_line.append(leading_spaces)
+    try:
+        def_line = [i for i, line in enumerate(lines) if "def" in line][0]
+        def_line_space = spaces_for_each_line[def_line]
+    except:
+        logger.warning("No def line found")
+        logger.warning(text)
+        def_line_space = 0
+    rank_unique_spaces = sorted(list(set(spaces_for_each_line)))
+    indentation_level = {}
+    i = 0
+    for space in rank_unique_spaces:
+        if space <= def_line_space:
+            indentation_level[space] = 0
+        else:
+            i += 1
+            indentation_level[space] = i
+    new_lines = []
+    for line, space in zip(lines, spaces_for_each_line):
+        new_lines.append("    " * indentation_level[space] + line.lstrip())
+    return "\n".join(new_lines)
+
+
+def create_prunepeft_config(model, **kwargs):
+    """
+    Create PrunePEFT configuration.
+
+    Args:
+        model: Base model
+        **kwargs: Configuration parameters
+    Returns:
+        PrunePEFTConfig
+    """
+    # Get adapter types
+    adapter_types_input = kwargs.get("adapter_types", ["lora"])
+    if isinstance(adapter_types_input, str):
+        adapter_types = [t.strip() for t in adapter_types_input.split(",")]
+    else:
+        adapter_types = adapter_types_input
+
+    # Get target modules - only use provided target_modules for LoRA-only configs
+    target_modules_input = kwargs.get("target_modules", None)
+    if target_modules_input and adapter_types == ["lora"]:
+        # For LoRA-only, use provided target_modules
+        if isinstance(target_modules_input, str):
+            target_modules = [
+                module.strip() for module in target_modules_input.split(",")
+            ]
+        else:
+            target_modules = target_modules_input
+    else:
+        # For bottleneck or combined configs, let the model decide target_modules
+        target_modules = None
+
+    # Parse layer selection lists
+    adapter_layers_input = kwargs.get("adapter_layers", None)
+    lora_layers_input = kwargs.get("lora_layers", None)
+
+    adapter_layers = None
+    if adapter_layers_input:
+        if isinstance(adapter_layers_input, str):
+            if adapter_layers_input.strip():
+                adapter_layers = [
+                    int(x.strip()) for x in adapter_layers_input.split(",")
+                ]
+        elif isinstance(adapter_layers_input, (list, tuple)):
+            # Fire converts comma-separated strings to tuples
+            # Filter out empty strings and convert to int
+            adapter_layers = [int(x) for x in adapter_layers_input if str(x).strip()]
+
+    lora_layers = None
+    if lora_layers_input:
+        if isinstance(lora_layers_input, str):
+            if lora_layers_input.strip():
+                lora_layers = [int(x.strip()) for x in lora_layers_input.split(",")]
+        elif isinstance(lora_layers_input, (list, tuple)):
+            # Fire converts comma-separated strings to tuples
+            # Filter out empty strings and convert to int
+            lora_layers = [int(x) for x in lora_layers_input if str(x).strip()]
+
+    config_kwargs = {
+        "task_type": "CAUSAL_LM",
+        "adapter_types": adapter_types,
+        "target_modules": target_modules,
+        "bias": kwargs.get("bias", "none"),
+        "adapter_layers": adapter_layers,
+        "lora_layers": lora_layers,
+    }
+
+    # Add parameters for all adapter types
+    if "lora" in adapter_types:
+        config_kwargs.update(
+            {
+                "r": kwargs.get("lora_rank", 8),
+                "lora_alpha": kwargs.get("lora_alpha", 16),
+                "lora_dropout": kwargs.get("lora_dropout", 0.1),
+            }
+        )
+
+    if "bottleneck" in adapter_types:
+        config_kwargs.update(
+            {
+                "bottleneck_size": kwargs.get("bottleneck_size", 64),
+                "bottleneck_dropout": kwargs.get("bottleneck_dropout", 0.1),
+                "init_bottleneck_weights": kwargs.get("init_bottleneck_weights", True),
+            }
+        )
+
+    return PrunePEFTConfig(**config_kwargs)
+
+
+def update_config_from_pruning_rankings(
+    current_config: PrunePEFTConfig,
+    rankings: dict,
+    modules_to_prune: int,
+    adapter_types: list,
+) -> PrunePEFTConfig:
+    """
+    根据剪枝排名更新配置，移除指定数量的模块。
+
+    Args:
+        current_config: 当前的PrunePEFTConfig
+        rankings: 剪枝排名结果 {method: [(prefix, names, score), ...]}
+        modules_to_prune: 要剪掉的模块数量
+        adapter_types: 适配器类型列表
+
+    Returns:
+        更新后的PrunePEFTConfig
+    """
+    # 选择剪枝策略（优先使用gradient方法）
+    pruning_method = "gradient" if "gradient" in rankings else list(rankings.keys())[0]
+    groups = rankings[pruning_method]
+
+    # 获取当前层配置
+    current_lora_layers = (
+        current_config.lora_layers.copy() if current_config.lora_layers else None
+    )
+    current_adapter_layers = (
+        current_config.adapter_layers.copy() if current_config.adapter_layers else None
+    )
+
+    # 从rankings中提取要剪掉的层索引
+    pruned_layers = set()
+    pruned_count = 0
+
+    for prefix, names, score in groups:
+        if pruned_count >= modules_to_prune:
+            break
+
+        # 从prefix中提取层索引（例如 "layers.5.self_attn" -> 5）
+        import re
+
+        match = re.search(r"layers\.(\d+)", prefix)
+        if match:
+            layer_idx = int(match.group(1))
+            pruned_layers.add(layer_idx)
+            pruned_count += 1
+            logger.info(f"剪枝层 {layer_idx} (prefix: {prefix}, score: {score:.6f})")
+
+    # 更新配置
+    new_config_kwargs = {
+        "task_type": current_config.task_type,
+        "adapter_types": adapter_types,
+        "target_modules": current_config.target_modules,
+        "bias": current_config.bias,
+    }
+
+    # 更新LoRA层配置
+    if "lora" in adapter_types:
+        if current_lora_layers is None:
+            # 如果原来是全部层，需要先获取所有层索引
+            # 这里假设是32层（Llama-2-7b），实际应该从模型获取
+            all_layers = list(range(32))  # 默认值，应该从模型动态获取
+            remaining_lora_layers = [i for i in all_layers if i not in pruned_layers]
+        else:
+            remaining_lora_layers = [
+                i for i in current_lora_layers if i not in pruned_layers
+            ]
+
+        new_config_kwargs.update(
+            {
+                "r": current_config.r,
+                "lora_alpha": current_config.lora_alpha,
+                "lora_dropout": current_config.lora_dropout,
+                "lora_layers": remaining_lora_layers if remaining_lora_layers else None,
+            }
+        )
+
+    # 更新Bottleneck层配置
+    if "bottleneck" in adapter_types:
+        if current_adapter_layers is None:
+            all_layers = list(range(32))  # 默认值，应该从模型动态获取
+            remaining_adapter_layers = [i for i in all_layers if i not in pruned_layers]
+        else:
+            remaining_adapter_layers = [
+                i for i in current_adapter_layers if i not in pruned_layers
+            ]
+
+        new_config_kwargs.update(
+            {
+                "bottleneck_size": current_config.bottleneck_size,
+                "bottleneck_dropout": current_config.bottleneck_dropout,
+                "init_bottleneck_weights": current_config.init_bottleneck_weights,
+                "adapter_layers": remaining_adapter_layers
+                if remaining_adapter_layers
+                else None,
+            }
+        )
+
+    return PrunePEFTConfig(**new_config_kwargs)
+
+
+def get_model_num_layers(model):
+    """获取模型的层数"""
+    return 32
+
+
+def compute_pruning_rankings_random(
+    model,
+    adapter_name: str = "default",
+    opts: tuple = ("lora", "adapter"),
+    process_info: dict = None,
+    top_p: int = 3,
+):
+    """
+    随机版本的compute_pruning_rankings，用于debug。
+    返回格式与compute_pruning_rankings相同：{ method: [(group_prefix, names_in_group, score), ...] }
+    """
+    import random
+
+    names = _get_trainable_parameter_names(model)
+    model_type = getattr(getattr(model, "config", None), "model_type", "")
+    groups = _group_parameters_by_prefix(
+        names, adapter_name=adapter_name, opts=opts, model_type=model_type
+    )
+
+    # 随机生成排名
+    vals = []
+    for group, gn in groups.items():
+        random_score = random.random()  # 生成0-1之间的随机分数
+        vals.append((group, gn, random_score))
+
+    # 随机排序并取top_p
+    random.shuffle(vals)
+    top_groups = vals[:top_p]
+
+    # 返回与compute_pruning_rankings相同的格式
+    return {"random": top_groups}
+
+
+def main(args=None):
+    if args is None:
+        parser = argparse.ArgumentParser(
+            description="PrunePEFT Training and Evaluation Script"
+        )
+
+        # Training parameters
+        parser.add_argument(
+            "--dataset",
+            type=str,
+            default="meta_math",
+            choices=[
+                "sst2",
+                "cola",
+                "qqp",
+                "mrpc",
+                "mnli",
+                "emo",
+                "squad",
+                "alpaca",
+                "qnli",
+                "gsm8k",
+                "alpaca_gpt4",
+                "flan",
+                "flan_v2",
+                "meta_math",
+                "meta_math_full",
+                "meta_math_5k",
+                "codefeedback",
+                "wizard_lm",
+            ],
+            help="Training dataset to use",
+        )
+        parser.add_argument(
+            "--adapter_types",
+            type=str,
+            default="lora",
+            help="Types of adapters to use (comma-separated like 'lora' or 'lora,bottleneck')",
+        )
+        parser.add_argument(
+            "--lora_rank", type=int, default=8, help="LoRA rank dimension"
+        )
+        parser.add_argument(
+            "--lora_alpha", type=int, default=16, help="LoRA alpha parameter"
+        )
+        parser.add_argument(
+            "--lora_dropout", type=float, default=0.1, help="LoRA dropout rate"
+        )
+        parser.add_argument(
+            "--bottleneck_size",
+            type=int,
+            default=64,
+            help="Size of bottleneck for bottleneck adapter",
+        )
+        parser.add_argument(
+            "--bottleneck_dropout",
+            type=float,
+            default=0.1,
+            help="Dropout for bottleneck adapter",
+        )
+        parser.add_argument(
+            "--init_bottleneck_weights",
+            type=bool,
+            default=True,
+            help="Whether to initialize bottleneck weights",
+        )
+        parser.add_argument(
+            "--adapter_layers",
+            type=str,
+            default="",
+            help="Comma-separated layer indices to apply Bottleneck adapter",
+        )
+        parser.add_argument(
+            "--lora_layers",
+            type=str,
+            default="",
+            help="Comma-separated layer indices to apply LoRA adapter",
+        )
+        parser.add_argument(
+            "--target_modules",
+            type=str,
+            default="q_proj,v_proj,k_proj,o_proj",
+            help="Target modules to apply adapter",
+        )
+        parser.add_argument(
+            "--sample_size", type=int, default=128, help="Number of samples"
+        )
+        parser.add_argument("--seed", type=int, default=42, help="Random seed")
+        parser.add_argument(
+            "--bias", type=str, default="none", help="Bias type (none/all/lora_only)"
+        )
+
+        # Pruning parameters
+        parser.add_argument(
+            "--pruning_rounds",
+            type=int,
+            default=0,
+            help="Number of pruning rounds (0 means no iterative pruning)",
+        )
+        parser.add_argument(
+            "--modules_per_round",
+            type=int,
+            default=1,
+            help="Number of PEFT modules to prune per round",
+        )
+        parser.add_argument(
+            "--random_pruning",
+            action="store_true",
+            default=False,
+            help="Use random pruning for debugging (ignores gradient/activation rankings)",
+        )
+
+        # Test parameters
+        parser.add_argument(
+            "--test_dataset",
+            type=str,
+            choices=["gsm8k", "humaneval", "mt-bench", "none"],
+            default="none",
+            help="Test dataset to evaluate on",
+        )
+        parser.add_argument(
+            "--model_path",
+            type=str,
+            default=None,
+            help="Path to the trained model for testing (if None, use the trained model)",
+        )
+        parser.add_argument(
+            "--adapter_path",
+            type=str,
+            default=None,
+            help="Path to the adapter to load for testing",
+        )
+        parser.add_argument(
+            "--save_path",
+            type=str,
+            default=None,
+            help="Path to save the trained model and pruning history",
+        )
+        parser.add_argument("--stage", type=str, default="all")
+
+        args = parser.parse_args()
+
+    # Extract parameters for backward compatibility
+    dataset = args.dataset
+    adapter_types = args.adapter_types
+    lora_rank = args.lora_rank
+    lora_alpha = args.lora_alpha
+    lora_dropout = args.lora_dropout
+    bottleneck_size = args.bottleneck_size
+    bottleneck_dropout = args.bottleneck_dropout
+    init_bottleneck_weights = args.init_bottleneck_weights
+    adapter_layers = args.adapter_layers
+    lora_layers = args.lora_layers
+    target_modules = args.target_modules
+    sample_size = args.sample_size
+    seed = args.seed
+    bias = args.bias
+    test_dataset = args.test_dataset
+    model_path = args.model_path
+    adapter_path = args.adapter_path
+    save_path = args.save_path
+    pruning_rounds = args.pruning_rounds
+    modules_per_round = args.modules_per_round
+    random_pruning = args.random_pruning
+    if args.stage == "all":
+        args.stage = "0,1,2,3"  # warmup, prune, train, eval
+    stages = [int(stage) for stage in args.stage.split(",")]
+
+    """
+    Main training and evaluation function for PrunePEFT.
+
+    Args:
+        args: Parsed command line arguments containing:
+            - Training parameters (adapter_types, lora_rank, etc.)
+            - Test parameters (test_dataset, model_path)
+    """
+    accelerator = Accelerator()
+    model_id = "/home/autopeft/LoRA-GA/ckpts/pretrained/Llama-2-7b-hf"
+    model_type = "CausalLM"
+    model_dtype = "bf16"
+    dataset_name = dataset
+
+    config = dict(
+        model="llama",
+        method="prunepeft",
+        d=dataset_name,
+        lora_r=lora_rank,
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        s=sample_size,
+        sd=seed,
+    )
+
+    wandb_name = "_".join([f"{k}={v}" for k, v in config.items()])
+
+    if accelerator.is_local_main_process:
+        wandb.init(
+            name=wandb_name,
+            mode="offline",
+            group="prunepeft",
+            project="PrunePEFT Methods",
+        )
+
+    model, tokenizer = initialize_text_to_text_model(
+        model_id, model_type, model_dtype, flash_attention=False
+    )
+
+    if accelerator.is_local_main_process:
+        logger.info("使用微调方法: PRUNEPEFT")
+        # logger.info("原始模型结构:")
+        # logger.info(model)
+
+    logger.info("创建PrunePEFT配置")
+
+    peft_config = create_prunepeft_config(
+        model=model,
+        adapter_types=adapter_types,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        bottleneck_size=bottleneck_size,
+        bottleneck_dropout=bottleneck_dropout,
+        init_bottleneck_weights=init_bottleneck_weights,
+        adapter_layers=adapter_layers,
+        lora_layers=lora_layers,
+        target_modules=target_modules,
+        bias=bias,
+    )
+
+    logger.info("PrunePEFT (%s) 配置:", ",".join(adapter_types).upper())
+    for adapter_type in adapter_types:
+        if adapter_type == "lora":
+            logger.info(
+                "  LoRA - r: %d, alpha: %d, dropout: %.3f",
+                peft_config.r,
+                peft_config.lora_alpha,
+                peft_config.lora_dropout,
+            )
+            logger.info("  LoRA layers (raw input): %s", lora_layers)
+            logger.info("  LoRA layers (config): %s", peft_config.lora_layers)
+        elif adapter_type == "bottleneck":
+            logger.info(
+                "  Bottleneck - size: %d, dropout: %.3f",
+                peft_config.bottleneck_size,
+                peft_config.bottleneck_dropout,
+            )
+            logger.info("  Bottleneck adapter layers (raw input): %s", adapter_layers)
+            logger.info(
+                "  Bottleneck adapter layers (config): %s", peft_config.adapter_layers
+            )
+    logger.info("  target_modules: %s", peft_config.target_modules)
+
+    dataset_func = DATASET_MAP[dataset_name]
+    train_set, val_set, _ = dataset_func()
+
+    sample_count = sample_size
+
+    save_dir = os.path.join("./snapshot", wandb_name)
+
+    ############################################################
+    # 阶段中间值
+    ############################################################
+
+    model = None
+    tokenizer = None
+
+    warmup_results = None
+    pruning_history = []
+
+    def warmup_stage():
+        nonlocal warmup_results
+        import json
+        
+        warmup_results = {}
+        logger.info("WARMUP STAGE - 联合分析")
+        logger.info("开始热身阶段：同时加载所有PEFT模块，分析剪枝倾向并分配策略")
+
+        # 1. 初始化基础模型
+        logger.info("初始化基础模型...")
+        base_model, tokenizer_obj = initialize_text_to_text_model(
+            model_id, model_type, model_dtype, flash_attention=False
+        )
+        num_layers = get_model_num_layers(base_model)
+        all_layers = list(range(num_layers))
+
+        logger.info(f"模型总共 {num_layers} 层，将分为 8 组进行分析:")
+        logger.info(f"  - LoRA 组: 4 组 (0-20%, 20-50%, 50-80%, 80-100%)")
+        logger.info(f"  - Adapter 组: 4 组 (0-20%, 20-50%, 50-80%, 80-100%)")
+
+        # 2. 创建联合 PEFT 配置 (LoRA + Bottleneck)
+        logger.info("创建联合 PEFT 配置...")
+        peft_config = create_prunepeft_config(
+            model=base_model,
+            adapter_types=["lora", "bottleneck"], 
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            bottleneck_size=bottleneck_size,
+            bottleneck_dropout=bottleneck_dropout,
+            init_bottleneck_weights=init_bottleneck_weights,
+            lora_layers=all_layers,
+            adapter_layers=all_layers,
+            target_modules=target_modules,
+            bias=bias,
+        )
+
+        logger.info("创建联合 PEFT 模型...")
+        peft_model = get_peft_model(base_model, peft_config)
+        peft_model = peft_model.to(accelerator.device)
+
+        if accelerator.is_local_main_process:
+            logger.info("模型配置:")
+            peft_model.print_trainable_parameters()
+
+        # 3. 收集数据
+        logger.info("设置数据收集钩子...")
+        # Collect info for both lora and adapter
+        hook_pruning_process_info(model=peft_model, adapter_name="default", opts=("lora", "adapter"))
+
+        logger.info("运行训练收集梯度/激活数据...")
+        peft_model = train_text_to_text_model(
+            run_name="warmup_joint_analysis",
+            train_dataset=train_set,
+            valid_dataset=val_set,
+            model=peft_model,
+            tokenizer=tokenizer_obj,
+            model_type=model_type,
+            per_device_batch_size=1,
+            real_batch_size=1,
+            max_length=1024,
+            num_train_epochs=1,
+            bf16=False,
+            logging_steps=1,
+            learning_rate=2e-5,
+            gradient_checkpointing=False,
+            seed=42,
+            eval_epochs=1,
+            early_stopping_patience=1,
+            training_args=dict(
+                lr_scheduler_type="constant",
+                max_grad_norm=1.0,
+                warmup_ratio=0.0,
+                weight_decay=0.0,
+                max_steps=8,
+                do_eval=False,
+                save_strategy="no",
+            ),
+        )
+
+        logger.info("采集剪枝过程信息...")
+        process_info = get_pruning_process_info(peft_model)
+        logger.info(f"采集完成: 梯度={len(process_info['gradients'])}, 激活={len(process_info['activations'])}")
+        cleanup_pruning_hooks()
+
+        # 4. 计算排名
+        logger.info("计算所有策略排名...")
+        rankings = compute_pruning_rankings(
+            model=peft_model,
+            adapter_name="default",
+            opts=("lora", "adapter"),
+            process_info=process_info,
+            top_p=30,
+        )
+
+        # 5. 统计分析
+        logger.info("按分组统计...")
+        stats = _analyze_mixed_blocks(rankings, num_layers)
+        
+        # 6. 分配策略
+        logger.info("执行策略分配逻辑...")
+        allocation_map = {} 
+        for region in stats.keys():
+            allocation_map[region] = set()
+
+        # Horizontal
+        for region, methods in stats.items():
+            if not methods: continue
+            best_method = max(methods.items(), key=lambda x: x[1])[0]
+            allocation_map[region].add(best_method)
+            logger.info(f"  [横向] 区域 {region} 最倾向方法: {best_method}")
+
+        # Vertical
+        method_stats = {}
+        for r, ms in stats.items():
+            for m, c in ms.items():
+                if m not in method_stats: method_stats[m] = {}
+                method_stats[m][r] = c
+        
+        for method, regions in method_stats.items():
+            if not regions: continue
+            best_region = max(regions.items(), key=lambda x: x[1])[0]
+            allocation_map[best_region].add(method)
+            logger.info(f"  [纵向] 方法 {method} 最倾向区域: {best_region}")
+
+        final_allocation = {k: list(v) for k, v in allocation_map.items()}
+
+        # 7. 保存结果
+        if save_path:
+            save_file = os.path.join(save_path, "warmup_partition.json")
+            try:
+                os.makedirs(save_path, exist_ok=True)
+                with open(save_file, "w") as f:
+                    json.dump({
+                        "allocation": final_allocation,
+                        "statistics": stats
+                    }, f, indent=2)
+                logger.info(f"分区信息已保存至: {save_file}")
+            except Exception as e:
+                logger.error(f"保存分区信息失败: {e}")
+
+        # 8. Update warmup_results
+        warmup_results = stats
+
+        # Output Summary
+        logger.info("\n" + "="*80)
+        logger.info("WARMUP 分析结果 (已保存)")
+        for r, ms in final_allocation.items():
+            logger.info(f"  {r}: {', '.join(ms)}")
+        logger.info("="*80)
+
+        # Cleanup
+        del peft_model, process_info, rankings, base_model
+        torch.cuda.empty_cache()
+
+    def _analyze_mixed_blocks(rankings, num_layers):
+        import re
+        
+        # Definitions
+        lora_groups = ["LoRA 0-20%", "LoRA 20-50%", "LoRA 50-80%", "LoRA 80-100%"]
+        adapter_groups = ["Adapter 0-20%", "Adapter 20-50%", "Adapter 50-80%", "Adapter 80-100%"]
+        
+        results = {name: {} for name in lora_groups + adapter_groups}
+        
+        def get_group_idx(layer_idx, total):
+            if total <= 0: return 0
+            r = layer_idx / total
+            if r < 0.2: return 0
+            elif r < 0.5: return 1
+            elif r < 0.8: return 2
+            return 3
+
+        logger.info(f"混合分析: {len(rankings)} 个策略, {num_layers} 层")
+
+        for strategy, groups in rankings.items():
+            count_per_strategy = 0
+            for prefix, names, score in groups:
+                # Check Layer
+                match = re.search(r'layers\.(\d+)', prefix)
+                if not match: continue
+                layer_idx = int(match.group(1))
+                if layer_idx >= num_layers: continue
+                
+                g_idx = get_group_idx(layer_idx, num_layers)
+                
+                # Check Type
+                # names is list of param names e.g. ["lora_A", "lora_B"]
+                is_lora = any("lora" in n for n in names)
+                is_adapter = any("adapter" in n or "bottleneck" in n for n in names)
+                
+                target_group = None
+                if is_lora:
+                    target_group = lora_groups[g_idx]
+                elif is_adapter:
+                    target_group = adapter_groups[g_idx]
+                
+                if target_group:
+                    if strategy not in results[target_group]:
+                        results[target_group][strategy] = 0
+                    results[target_group][strategy] += 1
+                    count_per_strategy += 1
+
+            if count_per_strategy > 0:
+                logger.info(f"  {strategy}: 总共 {count_per_strategy} 个条目")
+
+        return results
+
+    # 迭代剪枝流程
+    def pruning_stage():
+        nonlocal warmup_results, modules_per_round, pruning_history
+
+        logger.info(f"PRUNING STAGE")
+        nonlocal adapter_layers, lora_layers
+
+        logger.info(
+            f"开始迭代剪枝流程，共 {pruning_rounds} 轮，每轮剪除 {modules_per_round} 个模块"
+        )
+        logger.info(
+            "注意：剪枝阶段只进行剪枝决策，不训练模型；剪枝完成后再进行完整训练"
+        )
+
+        # 初始化基础模型用于剪枝决策
+        base_model, tokenizer = initialize_text_to_text_model(
+            model_id, model_type, model_dtype, flash_attention=False
+        )
+
+        current_adapter_layers = adapter_layers
+        current_lora_layers = lora_layers
+
+        # 获取模型层数
+        num_layers = get_model_num_layers(base_model)
+
+        # 如果当前配置是None（全部层），需要先设置所有层
+        if peft_config.lora_layers is None and "lora" in adapter_types:
+            current_lora_layers = list(range(num_layers))
+        if peft_config.adapter_layers is None and "bottleneck" in adapter_types:
+            current_adapter_layers = list(range(num_layers))
+
+        # 初始化全局已剪枝层集合
+        globally_pruned_layers = set()
+
+        # 剪枝阶段：只进行剪枝决策，不训练
+        for round_idx in range(pruning_rounds):
+            logger.info("=" * 80)
+            logger.info(f"剪枝轮次 {round_idx + 1}/{pruning_rounds}")
+            logger.info("=" * 80)
+
+            # 创建当前轮次的PEFT模型（用于剪枝决策）
+            current_peft_config = create_prunepeft_config(
+                model=base_model,
+                adapter_types=adapter_types,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                bottleneck_size=bottleneck_size,
+                bottleneck_dropout=bottleneck_dropout,
+                init_bottleneck_weights=init_bottleneck_weights,
+                adapter_layers=current_adapter_layers,
+                lora_layers=current_lora_layers,
+                target_modules=target_modules,
+                bias=bias,
+            )
+
+            model = get_peft_model(model=base_model, peft_config=current_peft_config)
+
+            # 确保模型在正确的设备上
+            model = model.to(accelerator.device)
+
+            if accelerator.is_local_main_process:
+                logger.info(f"剪枝轮次 {round_idx + 1} - PEFT模型配置:")
+                logger.info(f"  LoRA layers: {current_peft_config.lora_layers}")
+                logger.info(f"  Adapter layers: {current_peft_config.adapter_layers}")
+                model.print_trainable_parameters()
+
+            # 采集剪枝过程信息
+            logger.info(f"剪枝轮次 {round_idx + 1} - 设置剪枝钩子")
+            hook_pruning_process_info(
+                model=model,
+                adapter_name="default",
+                opts=("lora", "adapter"),
+            )
+            logger.info(f"剪枝轮次 {round_idx + 1} - 钩子设置完成")
+
+            # 运行少量训练批次以收集数据（使用标准trainer流程）
+            logger.info(f"剪枝轮次 {round_idx + 1} - 使用trainer进行剪枝信息收集")
+
+            model._mark_adapters_as_trainable()
+
+            # import pdb
+            # pdb.set_trace()
+
+            # 使用train_text_to_text_model函数进行小规模训练
+            # 为剪枝信息收集创建一个临时的小型训练数据集
+            # 从small_loader中提取数据用于训练
+
+            # 使用trainer进行训练（只训练很
+            # 少的步数）
+            # 注意：这里我们只使用很小的训练数据，所以使用简单的配置
+            model = train_text_to_text_model(
+                run_name=f"pruning_round_{round_idx}_step",
+                train_dataset=train_set,
+                valid_dataset=val_set,
+                model=model,
+                tokenizer=tokenizer,
+                model_type="CausalLM",
+                per_device_batch_size=1,
+                real_batch_size=1,
+                max_length=1024,
+                num_train_epochs=1,
+                bf16=False,
+                logging_steps=1,
+                learning_rate=2e-5,
+                gradient_checkpointing=False,
+                seed=42,
+                eval_epochs=1,
+                early_stopping_patience=1,
+                training_args=dict(
+                    lr_scheduler_type="constant",
+                    max_grad_norm=1.0,
+                    warmup_ratio=0.0,
+                    weight_decay=0.0,
+                    # 限制训练步数
+                    max_steps=8,
+                    do_eval=False,
+                    save_strategy="no",
+                ),
+            )
+
+            # 记录训练完成
+            batches_processed = 8
+
+            logger.info(
+                f"剪枝轮次 {round_idx + 1} - 运行了 {batches_processed} 个训练批次"
+            )
+
+            # 获取剪枝过程信息
+            logger.info(f"剪枝轮次 {round_idx + 1} - 采集剪枝过程所需信息（梯度/激活）")
+            process_info = get_pruning_process_info(model)
+            logger.info(
+                f"剪枝轮次 {round_idx + 1} - 采集完成: 梯度={len(process_info['gradients'])}, 激活={len(process_info['activations'])}"
+            )
+            cleanup_pruning_hooks()
+            logger.info(f"剪枝轮次 {round_idx + 1} - 清理剪枝钩子")
+
+            # 计算剪枝排名
+            if random_pruning:
+                logger.info(
+                    f"剪枝轮次 {round_idx + 1} - 计算剪枝排名（随机模式，用于debug）"
+                )
+                rankings = compute_pruning_rankings_random(
+                    model=model,
+                    adapter_name="default",
+                    opts=("lora", "adapter"),
+                    process_info=process_info,
+                    top_p=max(modules_per_round * 2, 10),
+                )
+            else:
+                logger.info(f"剪枝轮次 {round_idx + 1} - 计算剪枝排名")
+                rankings = compute_pruning_rankings(
+                    model=model,
+                    adapter_name="default",
+                    opts=("lora", "adapter"),
+                    process_info=process_info,
+                    top_p=max(modules_per_round * 2, 10),
+                    warmup_results=warmup_results
+                )
+
+            for method, groups in rankings.items():
+                logger.info(
+                    f"剪枝轮次 {round_idx + 1} - 策略[{method}] Top-{len(groups)} 分组:"
+                )
+                for prefix, names, score in groups[:5]:
+                    logger.info(
+                        f"  prefix={prefix}, score={score:.6f}, count={len(names)}"
+                    )
+
+            # 执行剪枝：更新配置
+            logger.info(f"剪枝轮次 {round_idx + 1} - 剪除 {modules_per_round} 个模块")
+
+            # 从rankings中选择要剪掉的模块（模块级精确剪枝）
+            pruning_method = 'block'
+            if pruning_method == "block":
+                modules_per_round = 8
+
+            groups = rankings[pruning_method]
+
+            # 新的模块级追踪结构
+            modules_to_prune = []  # 存储所有要剪枝的模块信息
+            layer_module_count = {}  # 统计每层要剪的模块数量
+            current_round_pruned = []
+            import re
+
+            for prefix, names, score in groups:
+                # 处理groups中的每个具体模块
+                for module_name in names:
+                    if len(modules_to_prune) >= modules_per_round:
+                        break
+                match = re.search(r"layers\.(\d+)", prefix)
+                if match:
+                    layer_idx = int(match.group(1))
+                    # 检查该层是否已经在之前的轮次中被剪掉
+                    if layer_idx not in globally_pruned_layers:
+                        pruned_layers.add(layer_idx)
+                        globally_pruned_layers.add(layer_idx)
+                        pruned_count += 1
+                        
+                        # Record pruned module info
+                        current_round_pruned.append({
+                            "layer_idx": layer_idx,
+                            "prefix": prefix,
+                            "score": float(score)
+                        })
+                        
+                        logger.info(
+                            f"  剪除层 {layer_idx} (prefix: {prefix}, score: {score:.6f})"
+                        )
+            
+            # Record history for this round
+            pruning_history.append({
+                "round": round_idx + 1,
+                "pruned_modules": current_round_pruned
+            })
+
+            # 更新层配置
+            if "lora" in adapter_types and current_lora_layers:
+                current_lora_layers = [
+                    i for i in current_lora_layers if i not in pruned_layers
+                ]
+                current_lora_layers = (
+                    current_lora_layers if current_lora_layers else None
+                )
+                logger.info(f"  更新后LoRA layers: {current_lora_layers}")
+
+            if "bottleneck" in adapter_types and current_adapter_layers:
+                current_adapter_layers = [
+                    i for i in current_adapter_layers if i not in pruned_layers
+                ]
+                current_adapter_layers = (
+                    current_adapter_layers if current_adapter_layers else None
+                )
+                logger.info(f"  更新后Adapter layers: {current_adapter_layers}")
+
+            # 清理当前轮次的临时变量以释放显存
+            del model, process_info, rankings
+            torch.cuda.empty_cache()
+
+            # 打印当前剪枝后的模型结构
+            if accelerator.is_local_main_process:
+                final_peft_config = create_prunepeft_config(
+                    model=base_model,
+                    adapter_types=adapter_types,
+                    lora_rank=lora_rank,
+                    lora_alpha=lora_alpha,
+                    lora_dropout=lora_dropout,
+                    bottleneck_size=bottleneck_size,
+                    bottleneck_dropout=bottleneck_dropout,
+                    init_bottleneck_weights=init_bottleneck_weights,
+                    adapter_layers=current_adapter_layers,
+                    lora_layers=current_lora_layers,
+                    target_modules=target_modules,
+                    bias=bias,
+                )
+                final_model = get_peft_model(
+                    model=base_model, peft_config=final_peft_config
+                )
+                # logger.info(f"剪枝轮次 {round_idx + 1} - 剪枝后的PEFT模型结构:")
+                # logger.info(final_model)
+                final_model.print_trainable_parameters()
+
+                # 清理临时模型以释放显存
+                del final_model, final_peft_config
+                torch.cuda.empty_cache()
+
+        adapter_layers = current_adapter_layers
+        lora_layers = current_lora_layers
+
+        return
+
+    def train_stage():
+        logger.info(f"TRAINING STAGE")
+        nonlocal model, tokenizer
+
+        # 剪枝完成，使用最终配置创建模型并完整训练
+        logger.info("=" * 80)
+        logger.info("剪枝阶段完成，开始完整训练")
+        logger.info(f"LORA {lora_layers}")
+        logger.info(f"ADAPTER {adapter_layers}")
+        logger.info("=" * 80)
+
+        # 重新初始化基础模型用于训练
+        base_model, tokenizer = initialize_text_to_text_model(
+            model_id, model_type, model_dtype, flash_attention=False
+        )
+
+        # 创建最终剪枝后的PEFT配置
+        final_peft_config = create_prunepeft_config(
+            model=base_model,
+            adapter_types=adapter_types,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            bottleneck_size=bottleneck_size,
+            bottleneck_dropout=bottleneck_dropout,
+            init_bottleneck_weights=init_bottleneck_weights,
+            adapter_layers=adapter_layers,
+            lora_layers=lora_layers,
+            target_modules=target_modules,
+            bias=bias,
+        )
+
+        model = get_peft_model(model=base_model, peft_config=final_peft_config)
+
+        # 确保模型在正确的设备上
+        model = model.to(accelerator.device)
+
+        if accelerator.is_local_main_process:
+            logger.info("最终剪枝后的PEFT模型配置:")
+            logger.info(f"  LoRA layers: {final_peft_config.lora_layers}")
+            logger.info(f"  Adapter layers: {final_peft_config.adapter_layers}")
+            logger.info("最终PEFT模型结构:")
+            logger.info(model)
+            model.print_trainable_parameters()
+
+        # 完整训练
+        logger.info("开始完整训练（剪枝后的模型）")
+        model = train_text_to_text_model(
+            run_name=os.path.join("peft_test", wandb_name),
+            train_dataset=train_set,
+            valid_dataset=val_set,
+            model=model,
+            tokenizer=tokenizer,
+            model_type=model_type,
+            num_train_epochs=1,
+            per_device_batch_size=1,
+            real_batch_size=128,
+            bf16=(model_dtype == "bf16"),
+            eval_epochs=1,
+            early_stopping_patience=3,
+            max_length=1024,
+            logging_steps=10,
+            use_loraplus=False,
+            loraplus_lr_ratio=None,
+            learning_rate=2e-5,
+            num_process=accelerator.num_processes,
+            gradient_checkpointing=False,
+            seed=seed,
+            training_args=dict(
+                lr_scheduler_type="cosine",
+                max_grad_norm=1.0,
+                warmup_ratio=0.03,
+                weight_decay=0.0,
+                save_strategy="epoch",
+                do_eval=True,
+            ),
+        )
+
+        # 保存最终模型
+        if save_path:
+            if accelerator.is_local_main_process:
+                # Save model
+                logger.info(f"保存模型到: {save_path}")
+                model.save_pretrained(save_path)
+                tokenizer.save_pretrained(save_path)
+                
+                # Save pruning history
+                import json
+                history_path = os.path.join(save_path, "pruning_history.json")
+                with open(history_path, "w") as f:
+                    json.dump(pruning_history, f, indent=2)
+                logger.info(f"保存剪枝历史到: {history_path}")
+
+        # final_model_path = save_dir
+        # if accelerator.is_local_main_process:
+        #     model.save_pretrained(final_model_path)
+        #     logger.info(f"最终模型已保存到: {final_model_path}")
+
+        #     # 重新加载最终模型验证
+        #     model, tokenizer = initialize_text_to_text_model(
+        #         model_id, model_type, model_dtype, flash_attention=False
+        #     )
+        #     model = PeftModel.from_pretrained(model, final_model_path)
+        #     # 确保模型在正确的设备上
+        #     model = model.to(accelerator.device)
+        #     logger.info("最终PrunePEFT模型（迭代剪枝后）:")
+        #     logger.info(model)
+
+    def eval_stage():
+        logger.info(f"EVAL STAGE")
+        nonlocal model, tokenizer
+
+        if adapter_path:
+            logger.info(f"使用Adapter路径进行测试: {adapter_path}")
+            
+            # If model is not initialized, initialize it
+            if model is None or tokenizer is None:
+                logger.info("初始化基础模型...")
+                model, tokenizer = initialize_text_to_text_model(
+                    model_id, model_type, model_dtype, flash_attention=False
+                )
+            
+            # Load adapter
+            from peft import PeftModel
+            logger.info(f"加载Adapter: {adapter_path}")
+            model = PeftModel.from_pretrained(model, adapter_path)
+            model = model.to(accelerator.device)
+            
+            if accelerator.is_local_main_process:
+                if test_dataset != "none":
+                    logger.info(f"开始使用加载了Adapter的模型进行测试数据集: {test_dataset}")
+                    accuracy = run_evaluation(
+                        test_dataset, model, tokenizer, accelerator
+                    )
+                    if accuracy is not None:
+                        logger.info(f"✅ 评估完成，GSM8K准确率: {accuracy:.4f}")
+            return
+
+        # Decide what to evaluate
+        if model_path:
+            # If specific model path is provided, use legacy path-based evaluation
+            logger.info(f"使用外部模型文件进行测试: {model_path}")
+            if accelerator.is_local_main_process and test_dataset != "none":
+                run_evaluation(test_dataset, model_path)
+            return
+
+        # Check if we have a trained model from previous stages
+        if model is None or tokenizer is None:
+            logger.warning("没有训练好的模型可用，无法进行评估")
+            if test_dataset != "none":
+                logger.info("初始化基础模型进行基准测试...")
+                model, tokenizer = initialize_text_to_text_model(
+                    model_id, model_type, model_dtype, flash_attention=False
+                )
+
+        # Run direct model evaluation
+        if accelerator.is_local_main_process:
+            if test_dataset != "none":
+                logger.info(f"开始使用训练模型进行测试数据集: {test_dataset}")
+                if model is not None and tokenizer is not None:
+                    accuracy = run_evaluation(
+                        test_dataset, model, tokenizer, accelerator
+                    )
+                    if accuracy is not None:
+                        logger.info(f"✅ 评估完成，GSM8K准确率: {accuracy:.4f}")
+                else:
+                    logger.error("❌ 无法进行评估：模型未正确加载")
+
+    if 0 in stages:
+        warmup_stage()
+    if 1 in stages:
+        pruning_stage()
+    if 2 in stages:
+        train_stage()
+    if 3 in stages:
+        eval_stage()
+
+
+def run_evaluation(test_dataset, final_model, tokenizer=None, accelerator=None):
+    """
+    Run evaluation on specified test dataset.
+
+    Args:
+        test_dataset: Name of the test dataset ("gsm8k", "humaneval", "mt-bench")
+        final_model: Can be either a path string (legacy) or model object (new)
+        tokenizer: Tokenizer for direct model evaluation
+        accelerator: Accelerator for device management
+    """
+    model_name = "llama"
+
+    # Check if final_model is a path string or model object
+    if isinstance(final_model, str):
+        # Legacy path-based evaluation
+        if test_dataset == "gsm8k":
+            run_gsm8k_evaluation(final_model)
+        elif test_dataset == "humaneval":
+            run_humaneval_evaluation(final_model)
+        elif test_dataset == "mt-bench":
+            run_mtbench_evaluation(final_model)
+        else:
+            logger.warning(f"不支持的测试数据集: {test_dataset}")
+    else:
+        # Direct model evaluation
+        if test_dataset == "gsm8k":
+            if tokenizer is None or accelerator is None:
+                raise ValueError(
+                    "tokenizer and accelerator required for direct model evaluation"
+                )
+            return run_gsm8k_evaluation(final_model, tokenizer, accelerator)
+        elif test_dataset == "humaneval":
+            if tokenizer is None or accelerator is None:
+                raise ValueError(
+                    "tokenizer and accelerator required for direct model evaluation"
+                )
+            return run_humaneval_evaluation(final_model, tokenizer, accelerator)
+        elif test_dataset == "mt-bench":
+            if tokenizer is None or accelerator is None:
+                raise ValueError(
+                    "tokenizer and accelerator required for direct model evaluation"
+                )
+            return run_mtbench_evaluation(final_model, tokenizer, accelerator)
+        else:
+            logger.warning(f"不支持的测试数据集: {test_dataset}")
+
+
+def run_gsm8k_evaluation(model, tokenizer, accelerator):
+    """
+    Run GSM8K evaluation using the torch model directly
+
+    Args:
+        model: The trained PyTorch model (PEFT model)
+        tokenizer: The tokenizer
+        accelerator: Accelerator instance for device management
+    """
+    import re
+
+    from tqdm import tqdm
+
+    from examples.data import load_gsm8k
+
+    # Configure tokenizer for decoder-only model (left padding for generation)
+    tokenizer.padding_side = "left"
+    tokenizer.truncation_side = "left"
+
+    # Determine model architecture and set appropriate system prompt
+    temperature = 0.8
+    eval_seed = 0
+    torch.manual_seed(eval_seed)
+    bsz = 4
+    device = accelerator.device
+    model = model.to(device)
+
+    # Load GSM8K test set
+    _, _, test_set = load_gsm8k()
+
+    def extract_num(text):
+        """Extract number following #### pattern"""
+        pattern = r"####\s*(\d+)"
+        match = re.search(pattern, text)
+        if match:
+            result = match.group(1)
+            try:
+                return int(result.replace(",", ""))
+            except:
+                logger.warning(f"无法转换数字: '{result}'")
+                return None
+        else:
+            # Try to find any number at the end if pattern fails
+            try:
+                # Look for a number at the end of the text
+                words = text.strip().split()
+                for word in reversed(words):
+                    clean_word = word.replace(",", "").replace(".", "")
+                    if clean_word.isdigit():
+                        return int(clean_word)
+            except:
+                pass
+            logger.debug(f"未找到数字模式 in text: {text}")
+            return None
+
+    model_type = "CausalLM"
+    # model = LLM(model_name, dtype="bfloat16", seed=eval_seed)
+    # sampling_params = SamplingParams(
+    #     top_p=0.95, temperature=temperature, max_tokens=1024
+    # )
+    all = 0
+    correct = 0
+    t = tqdm(range(0, len(test_set), bsz))
+    # t = tqdm(range(0, bsz, bsz))
+    for idx in t:
+        examples = test_set[idx : idx + bsz]
+        prompts = examples["x"]
+        outputs = model_inference_batch(
+            model, tokenizer, prompts, model_type, max_target_length=512
+        )
+        # outputs = model.generate(
+        #     prompts, sampling_params=sampling_params, use_tqdm=False
+        # )
+        for y, output, prompt in zip(examples["y"], outputs, prompts):
+            pred_text = output
+            gt = extract_num(y)
+            pred = extract_num(pred_text)
+            correct += int(gt == pred)
+            all += 1
+            t.set_description(f"Accuracy: {correct / all * 100:02f}%")
+
+            logger.info("##############################")
+            logger.info(f"Prompt: {prompt}")
+            logger.info(f"Ground Truth: {y}")
+            logger.info(f"Prediction: {pred_text}")
+
+    print("Acc:", correct / all)
+    # append to gsm8k_results.txt (create if not exists)
+    if not os.path.exists("gsm8k_results.txt"):
+        with open("gsm8k_results.txt", "w") as f:
+            f.write("Model Acc\n")
+    with open("gsm8k_results.txt", "a") as f:
+        f.write(
+            f"eval_seed={eval_seed},temperature={temperature}    {correct / all}\n"
+        )
+
+
+def run_humaneval_evaluation(model_path_or_model, tokenizer=None, accelerator=None):
+    """
+    Run HumanEval evaluation using model_inference_batch.
+
+    Args:
+        model_path_or_model: Either a path string (legacy) or model object (new)
+        tokenizer: Tokenizer for direct model evaluation (required for model object)
+        accelerator: Accelerator for device management (required for model object)
+    """
+    # Check if we need to use legacy path-based evaluation
+    if isinstance(model_path_or_model, str):
+        # Legacy path-based evaluation (subprocess calling this same script)
+        try:
+            cmd = [
+                "python",
+                __file__,
+                "--test_dataset",
+                "humaneval",
+                "--model_path",
+                model_path_or_model,
+            ]
+            logger.info(f"运行HumanEval评估 (legacy path-based): {' '.join(cmd)}")
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, cwd=os.getcwd()
+            )
+            logger.info("HumanEval评估结果:")
+            logger.info(result.stdout)
+            if result.stderr:
+                logger.warning(f"HumanEval评估错误: {result.stderr}")
+        except Exception as e:
+            logger.error(f"HumanEval评估失败: {e}")
+        return
+
+    # Direct model evaluation using model_inference_batch
+    try:
+        import tqdm
+        from human_eval.data import read_problems, write_jsonl
+
+        # Load HumanEval problems
+        problems = read_problems()
+
+        # Set model type
+        model_type = "CausalLM"
+        model = model_path_or_model
+
+        # Get number of problems
+        num_problems = len(problems)
+        num_samples_per_task = 5  # Standard for HumanEval
+
+        logger.info(
+            f"开始HumanEval评估: {num_problems} 个问题, 每题 {num_samples_per_task} 个样本"
+        )
+
+        # Process each task
+        all_samples = []
+        task_ids = list(problems.keys())
+
+        for task_id in tqdm.tqdm(task_ids, desc="Processing tasks"):
+            prompt = problems[task_id]["prompt"]
+
+            # Generate multiple completions for this task
+            prompts = []
+            for _ in range(num_samples_per_task):
+                # Apply template
+                prompt_in = ALPACA_PREFIX_TEMPLATE_MD.format(PROMPT=prompt)
+                prompts.append(prompt_in)
+
+            # Use model_inference_batch for efficient batch inference
+            try:
+                outputs = model_inference_batch(
+                    model, tokenizer, prompts, model_type, max_target_length=512
+                )
+
+                # Process each output
+                for output in outputs:
+                    post_pred = post_process(output)
+                    all_samples.append(dict(task_id=task_id, completion=post_pred))
+
+            except Exception as e:
+                logger.warning(f"Error processing task {task_id}: {e}")
+                # Handle errors gracefully by generating empty completions
+                for _ in range(num_samples_per_task):
+                    all_samples.append(
+                        dict(
+                            task_id=task_id, completion="# Error generating completion"
+                        )
+                    )
+
+        # Save results
+        model_id = "unknown_model"
+        if hasattr(model, "model_id_or_path"):
+            model_id = model.model_id_or_path
+        elif hasattr(model, "_get_name"):
+            model_id = model._get_name()
+        elif hasattr(model, "config") and hasattr(model.config, "_name_or_path"):
+            model_id = model.config._name_or_path
+
+        target_name = f"humaneval_samples_{model_id.replace('/', '_')}.jsonl"
+        target_name = os.path.join("./code_eval", target_name)
+
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(target_name), exist_ok=True)
+
+        write_jsonl(target_name, all_samples, append=False)
+        logger.info(f"HumanEval结果已保存到: {target_name}")
+        logger.info(f"共生成 {len(all_samples)} 个样本完成")
+
+    except ImportError as e:
+        logger.error(f"缺少HumanEval依赖: {e}")
+        logger.info("请安装: pip install human-eval")
+    except Exception as e:
+        logger.error(f"HumanEval评估失败: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+
+def run_mtbench_evaluation(model_path_or_model, tokenizer=None, accelerator=None):
+    """
+    Run MT-Bench evaluation using model_inference_batch.
+
+    Args:
+        model_path_or_model: Either a path string (legacy) or model object (new)
+        tokenizer: Tokenizer for direct model evaluation (required for model object)
+        accelerator: Accelerator for device management (required for model object)
+    """
+    # Check if we need to use legacy path-based evaluation
+    if isinstance(model_path_or_model, str):
+        # Legacy path-based evaluation (subprocess calling this same script)
+        try:
+            cmd = [
+                "python",
+                __file__,
+                "--test_dataset",
+                "mt-bench",
+                "--model_path",
+                model_path_or_model,
+            ]
+            logger.info(f"运行MT-Bench评估 (legacy path-based): {' '.join(cmd)}")
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, cwd=os.getcwd()
+            )
+            logger.info("MT-Bench评估结果:")
+            logger.info(result.stdout)
+            if result.stderr:
+                logger.warning(f"MT-Bench评估错误: {result.stderr}")
+        except Exception as e:
+            logger.error(f"MT-Bench评估失败: {e}")
+        return
+
+    # Direct model evaluation using model_inference_batch
+    try:
+        import json
+        import tqdm
+        from examples.data import load_alpaca
+
+        # Load MT-Bench questions (using alpaca as proxy for now)
+        _, _, test_set = load_alpaca()
+
+        # Set model type
+        model_type = "CausalLM"
+        model = model_path_or_model
+
+        tokenizer.padding_side = "left"
+        tokenizer.truncation_side = "left"
+
+        # Test on first 100 samples (standard MT-Bench setup)
+        test_samples = test_set.select(range(min(100, len(test_set))))
+
+        results = []
+        logger.info("开始MT-Bench推理...")
+
+        # Process in batches using model_inference_batch
+        batch_size = 4
+        for i in tqdm.tqdm(range(0, len(test_samples), batch_size), desc="Processing batches"):
+            # Get batch of examples (returns Dataset object)
+            batch_examples = test_samples[i:i + batch_size]
+            batch_prompts = list(batch_examples["x"])
+
+            try:
+                # Generate predictions using batch inference
+                outputs = model_inference_batch(
+                    model, tokenizer, batch_prompts, model_type, max_target_length=1024
+                )
+
+                # Process each output in the batch
+                batch_ground_truths = list(batch_examples["y"])
+                for j, (question, ground_truth, pred_text) in enumerate(zip(batch_prompts, batch_ground_truths, outputs)):
+                    global_idx = i + j
+                    results.append(
+                        {
+                            "question": question,
+                            "ground_truth": ground_truth,
+                            "prediction": pred_text,
+                            "index": global_idx,
+                        }
+                    )
+
+            except Exception as e:
+                logger.warning(f"Error processing batch {i//batch_size}: {e}")
+                # Handle errors gracefully by generating empty predictions
+                batch_ground_truths = list(batch_examples["y"])
+                for j, (question, ground_truth) in enumerate(zip(batch_prompts, batch_ground_truths)):
+                    global_idx = i + j
+                    results.append(
+                        {
+                            "question": question,
+                            "ground_truth": ground_truth,
+                            "prediction": "# Error generating prediction",
+                            "index": global_idx,
+                        }
+                    )
+
+        # Save results
+        model_id = "unknown_model"
+        if hasattr(model, 'model_id_or_path'):
+            model_id = model.model_id_or_path
+        elif hasattr(model, '_get_name'):
+            model_id = model._get_name()
+        elif hasattr(model, 'config') and hasattr(model.config, '_name_or_path'):
+            model_id = model.config._name_or_path
+
+        output_file = f"./mt_bench_results_{model_id.replace('/', '_')}.json"
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else ".", exist_ok=True)
+
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"MT-Bench结果已保存到: {output_file}")
+        logger.info(f"共生成 {len(results)} 个推理结果，供GPT评判使用")
+
+    except ImportError as e:
+        logger.error(f"缺少依赖: {e}")
+        logger.info("请确保数据加载模块可用")
+    except Exception as e:
+        logger.error(f"MT-Bench评估失败: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
