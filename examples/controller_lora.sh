@@ -1,4 +1,4 @@
-tm#!/bin/bash
+#!/bin/bash
 
 # 参数配置
 DATASET="meta_math"
